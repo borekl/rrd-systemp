@@ -1,0 +1,305 @@
+#!/usr/bin/perl
+
+use v5.10;
+use strict;
+use warnings;
+use RRDTool::OO;
+use FindBin qw($Bin);
+use POSIX qw(strftime);
+use Path::Tiny;
+use Template;
+
+#--- definitions
+
+# directory, where the rrd files will be stored; this can be absolute path,
+# relative path or undefined
+my $rrddir = 'rrd';
+
+# directory where images and HTML files will be created
+my $dstdir = 'html';
+
+# graph dimensions
+my ($img_w, $img_h) = (800, 160);
+
+# sources
+my @sources = (
+  {
+    name => 'cpu_temp',
+    type => 'sensors',
+    rrdtype => 'GAUGE',
+    src => 'temp1_input',
+    color => '00CC00',
+    label => 'CPU',
+  },
+  {
+    name => 'mb_temp',
+    type => 'sensors',
+    rrdtype => 'GAUGE',
+    src => 'temp2_input',
+    color => '00CCCC',
+    label => 'MB',
+  },
+  {
+    name => 'case_temp',
+    type => 'sensors',
+    rrdtype => 'GAUGE',
+    src => 'temp3_input',
+    color => '3333FF',
+    label => 'Case',
+  },
+  {
+    name => 'hdd_sda',
+    type => 'hddtemp',
+    rrdtype => 'GAUGE',
+    src => '/dev/sda',
+    color => 'CC00CC'
+  },
+  {
+    name => 'hdd_sdb',
+    type => 'hddtemp',
+    rrdtype => 'GAUGE',
+    src => '/dev/sdb',
+    color => 'AACC00'
+  },
+  {
+    name => 'hdd_sdc',
+    type => 'hddtemp',
+    rrdtype => 'GAUGE',
+    src => '/dev/sdc',
+    color => 'CC0077'
+  },
+);
+
+
+#==============================================================================
+#=== FUNCTIONS ================================================================
+#==============================================================================
+
+sub get_location
+{
+  my $dir = shift;
+  my $path = path($Bin);
+
+  # return default path if no argument
+  return $path if !$dir;
+
+  # get absolute/relative path if argument is specified
+  if(path($dir)->is_absolute) {
+    $path = path($dir);
+  } else {
+    $path = $path->child($dir);
+  }
+
+  # ensure the resulting path's existence
+  if(!$path->exists) {
+    die "Directory " . $path . " does not exist";
+  }
+
+  # finish
+  return $path;
+}
+
+sub read_sensors
+{
+  my @vars = @_;
+  my %re;
+
+  open(my $fh, '-|', 'sensors -u') or die 'Cannot open sensors';
+
+  while(my $l = <$fh>) {
+    chomp $l;
+    foreach my $var (@vars) {
+      if($l =~ /^\s*${var}:\s+(.*)$/) {
+        $re{$var} = $1;
+      }
+    }
+  }
+
+  close($fh);
+  return \%re;
+}
+
+sub read_disktemp
+{
+  my $disk = shift;
+
+  open(my $fh, '-|', "hddtemp $disk") or die 'Cannot open hddtemp';
+  my $l = <$fh>;
+  close($fh);
+  chomp $l;
+
+  # data is returned as a tuple (device, device description, temperature)
+  my @data = split(': ', $l);
+  $data[2] =~ s/^(\d+).*/$1/;
+  return @data;
+}
+
+#read_sensors('temp1_input', 'temp2_input', 'temp3_input');
+#say join(', ', read_disktemp('/dev/sdc'));
+
+#==============================================================================
+#=== MAIN =====================================================================
+#==============================================================================
+
+#--- get hostname
+
+open(my $fh, '-|', 'hostname') or die;
+my $hostname = <$fh>;
+chomp($hostname);
+close($fh);
+
+#--- get location of the rrd file
+
+my $rrdfile = get_location($rrddir)->child('systemp.rrd');
+
+#--- get RRDTool::OO instance
+
+my $rrd = RRDTool::OO->new(
+  file => $rrdfile->canonpath,
+);
+
+#--- create RRD file if it does not already exist
+
+if(!$rrdfile->exists) {
+  $rrd->create(
+    step => 300,
+    # data sources
+    ( map {
+      ( data_source => { name => $_->{name}, type => $_->{rrdtype} } )
+    } @sources ),
+    # 1 week at 5 minute interval
+    archive => {
+      cpoints => 1,
+      rows => 12*24*7,
+      cfunc => 'AVERAGE'
+    },
+    # 1 month at 10 minute interval
+    archive => {
+      cpoints => 2,
+      rows => 6*24*30,
+      cfunc => 'AVERAGE'
+    },
+    # 1 year at 2 hour interval
+    archive => {
+      cpoints => 24,
+      rows => 12*365,
+      cfunc => 'AVERAGE'
+    },
+    # 10 years at 1 day interval
+    archive => {
+      cpoints => 288,
+      rows => 365*10,
+      cfunc => 'AVERAGE'
+    },
+  );
+}
+
+#--- values to be stored in RRD
+
+my %values;
+
+#--- read sensors
+
+my @sensors = grep { $_->{type} eq 'sensors' } @sources;
+
+if(@sensors) {
+
+  # read sensor data
+  my $sensors_data = read_sensors(map { $_->{src} } @sensors);
+
+  # remap sensor data from sensor names to user configured names
+  foreach my $sd (keys %$sensors_data) {
+    my ($se) = map { $_->{name} } grep { $_->{src} eq $sd } @sensors;
+    $values{$se} = $sensors_data->{$sd};
+  }
+}
+
+#--- read drive temperatures
+
+my @drives = grep { $_->{type} eq 'hddtemp' } @sources;
+
+foreach my $drive (@drives) {
+  my ($dev, $desc, $temp) = read_disktemp($drive->{src});
+  $values{$drive->{name}} = $temp;
+  $drive->{label} = "$desc ($dev)";
+}
+
+#--- update RRD database
+
+$rrd->update(values => \%values);
+
+#--- generate graph
+
+my $dst = get_location($dstdir);
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+
+my @draw = map {
+  {
+    color => $_->{color},
+    legend => $_->{label},
+    dsname => $_->{name},
+    type => 'line',
+    thickness => 2,
+  }
+} @sources;
+
+$rrd->graph(
+  image => $dst->child('systemp-day.png')->canonpath,
+  start => (time() - 86400),
+  end => time(),
+  lower_limit => 20,
+  upper_limit => 80,
+  width => $img_w,
+  height => $img_h,
+  ( map { ( draw => $_ ) } @draw ),
+);
+
+$rrd->graph(
+  image => $dst->child('systemp-week.png')->canonpath,
+  start => (time() - 7*86400),
+  end => time(),
+  lower_limit => 20,
+  upper_limit => 80,
+  width => $img_w,
+  height => $img_h,
+  ( map { ( draw => $_ ) } @draw ),
+) if !$min;
+
+$rrd->graph(
+  image => $dst->child('systemp-month.png')->canonpath,
+  start => (time() - 30*86400),
+  end => time(),
+  lower_limit => 20,
+  upper_limit => 80,
+  width => $img_w,
+  height => $img_h,
+  ( map { ( draw => $_ ) } @draw ),
+) if !$hour && !$min;
+
+$rrd->graph(
+  image => $dst->child('systemp-year.png')->canonpath,
+  start => (time() - 365*86400),
+  end => time(),
+  lower_limit => 20,
+  upper_limit => 80,
+  width => $img_w,
+  height => $img_h,
+  ( map { ( draw => $_ ) } @draw ),
+) if !$hour && !$min;
+
+#--- create html file
+
+my $tt = Template->new({
+  ABSOLUTE => 1,
+  ENCODING => 'utf8',
+});
+
+$tt->process(
+  "$Bin/index.tt",
+  {
+    gentime => strftime('%c', localtime()),
+    host => $hostname,
+  },
+  "$dstdir/index.html",
+  { binmode => ':utf8' }
+) || die $tt->error(), "\n";
